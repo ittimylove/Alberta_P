@@ -1,0 +1,1209 @@
+% paper.tex —— 由 source/acl_latex.tex 拍平：\input 已展开，注释、废稿（\iffalse）、参考文献已去掉。
+% 读正文就读这个文件；行号和 outline.md 对得上。
+% ==== 正文用到的自定义宏（1 个；看不懂的记号先查这里）====
+\newcommand{\method}{\textsc{Life-Harness}}
+% ==== 正文 ====
+\maketitle
+
+\begin{abstract}
+    LLM agents are shaped not only by their language models, but also by the runtime harness that mediates observation, tool use, action execution, feedback interpretation, and trajectory control. While existing agent adaptation methods mainly update model parameters, many failures in deterministic, rule-governed domains stem from mismatches at the model--environment interface.
+    We propose \method{}, a lifecycle-aware runtime harness that improves frozen LLM agents without changing model weights or evaluation environments. \method{} evolves from training trajectories by converting recurring interaction failures into reusable interventions across environment contracts, procedural skills, action realization, and trajectory regulation, and remains fixed for evaluation on unseen tasks.
+    On seven deterministic environments from $\tau$-bench, $\tau^2$-bench, and AgentBench, \method{} improves 116 out of 126 model--environment settings across 18 model backbones, with an average relative improvement of 88.5\%. Harnesses evolved only from Qwen3-4B-Instruct trajectories transfer to 17 other models, showing that \method{} captures reusable environment-side structure rather than model-specific behavior. These results position runtime interface adaptation as a complementary alternative to model-centric agent training. Code is available at \href{https://github.com/Tianshi-Xu/Life-Harness}{GitHub}.
+
+    \begin{figure}[h]
+        \centering
+        \includegraphics[width=1.0\linewidth]{imgs/exp_abstract.pdf}
+        \caption{Adapting the runtime harness, not the model. 
+        \method{} keeps LLM weights fixed and evolves reusable interface interventions from training trajectories, yielding broad and substantial gains across agentic tasks, benchmarks, and model backbones.}
+        \label{fig:abstract}
+    \end{figure}
+\end{abstract}
+\section{Introduction}
+\begin{figure*}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/intro.pdf}
+    \caption{(a) An agent is not just an LLM: its behavior is shaped by the runtime harness that mediates observations, tools, actions, and feedback. 
+    (b) We adapt this runtime interface, rather than model parameters, yielding a fixed and reusable harness for frozen agents across deterministic environments.}
+    \label{fig:intro}
+\end{figure*}
+An LLM agent is not just an LLM. As shown in Figure~\ref{fig:intro} (a), it is a model embedded in a stateful interaction loop: the environment exposes observations, the runtime system specifies available tools and actions, the model emits an action or tool call, an executor applies it to the environment, and the resulting feedback updates the next decision~\cite{wang2024executable,anthropic2026claudecode}. The resulting behavior is therefore determined not only by the model, but also by the runtime harness that mediates how the model observes the environment, understands tools, realizes actions, and interprets feedback. This system-level view is increasingly important across agent applications, including software engineering assistants~\cite{yang2024swe,openai2026codexcli,opencode2026}, web navigation~\cite{zhou2024webarena}, database manipulation~\cite{lei2025spider}, operating-system control~\cite{xie2024osworld,liu2024agentbench}, tool-using business workflow agents~\cite{yao2024tau_tau-bench,barres2025tau_tau2-bench}, and embodied interaction~\cite{shridhar2020alfworld}.
+
+Despite this, agent adaptation is still commonly framed as model adaptation, including model scaling~\cite{dubey2024llama,qwen2.5}, fine-tuning~\cite{chen2023fireact,prabhakar2026apigen_Salesforce_xLAM2}, reinforcement learning~\cite{guo2025deepseek_Deepseek-r1,qi2025webrl}, and distillation~\cite{kang2026distilling,agarwal2024policy}.
+These approaches are powerful, but they implicitly absorb domain-specific behavior into model parameters. 
+In deterministic, rule-governed domains, much of the relevant structure instead lives outside the model: tool schemas, API contracts, admissible actions, feedback rules, stopping conditions, and recovery strategies. 
+This distinction is reflected in the gap between static capability and interactive performance. 
+For example, Qwen3.5-4B achieves 74.0\% on HMMT~Feb~\cite{hmmt2026}, a competition-level mathematical reasoning benchmark, but only 43.1\% on ALFWorld~\cite{shridhar2020alfworld}, a deterministic embodied interaction benchmark. 
+Such failures often stem not from a lack of latent reasoning ability, but from mismatches at the model--environment boundary: poorly structured observations, misunderstood tool contracts, non-executable actions, feedback that fails to trigger recovery, or degenerate trajectory dynamics.
+This suggests an alternative path for agent improvement: rather than embedding all environment-specific constraints into model weights, one can expose stable environment-side structure through the runtime interface where the model observes, acts, and recovers.
+
+Recent work has begun to explore this direction by optimizing the runtime harness around frozen LLM agents, including reasoning-time compute controllers~\cite{zheng2026llms_AutoTTS_LLMs-Improving-LLMs}, online workspace adaptation in interactive games~\cite{sarafian2026workspace_DREAMTEAM,karten2026continual_Continual-Harness}, harness-flag optimization~\cite{sengupta2026harbor_HARBOR}, and automated harness-code search~\cite{lee2026meta_Meta-harness,lin2026agentic}. 
+These studies establish harness optimization as an important alternative to model training, but they largely treat the harness as a policy, mutable state, configuration space, or code artifact to be optimized as a whole. 
+We instead focus on deterministic agent domains, where the harness can be viewed as a stable runtime interface between a frozen model and a rule-governed environment. 
+In this setting, recurring failures can be localized to specific stages of the interaction lifecycle, allowing failure-specific interface interventions to be evolved from training trajectories and then fixed during evaluation on unseen tasks. 
+This raises our central question: \emph{Can training trajectories reveal stable failure structures that can be converted into a structured runtime interface to improve LLM agents across unseen tasks and diverse model architectures?}
+
+We answer this question with \method{}, a lifecycle-aware runtime harness for deterministic LLM agents. 
+Rather than updating model parameters or searching over unconstrained harness code~\cite{lee2026meta_Meta-harness}, \method{} adapts the runtime layer that mediates how a frozen model observes the environment, uses tools, realizes actions, interprets feedback, and recovers from degenerate trajectories. 
+To model this runtime interface, \method{} organizes adaptation into four lifecycle layers. 
+The \textbf{Environment Contract Layer} calibrates tool descriptions and interface constraints before interaction. 
+The \textbf{Procedural Skill Layer} distills reusable procedures from past trajectories and retrieves them for the current task and state. 
+The \textbf{Action Realization Layer} validates and canonicalizes model-generated actions before execution, preventing deterministic failures. 
+The \textbf{Trajectory Regulation Layer} monitors post-execution dynamics, detects degenerate patterns such as repetition, stagnation, invalid retries, or budget exhaustion, and triggers recovery when needed. 
+
+\method{} is then evolved from training trajectories by diagnosing recurring interaction failures and converting them into reusable, auditable runtime interventions, while the resulting harness remains fixed for evaluation on unseen tasks.
+
+We evaluate~\method~on seven deterministic agent environments from $\tau$-bench~\cite{yao2024tau_tau-bench}, $\tau^2$-bench~\cite{barres2025tau_tau2-bench}, and AgentBench~\cite{liu2024agentbench}, spanning household interaction, web shopping, OS control, database tasks, and policy-guided business workflows. 
+Across 18 instruction-tuned, reasoning, and agent-specialized backbones,~\method~improves 116 of 126 model--environment settings, yielding an average relative gain of \textbf{88.5\%}. 
+The harnesses are evolved only from Qwen3-4B-Instruct~\cite{qwen3technicalreport} trajectories and then reused across the other 17 backbones, suggesting that~\method{} captures reusable environment-side structure rather than model-specific behavior.
+Finally,~\method~is complementary to model training: it enables Qwen2.5-32B-Instruct~\cite{qwen2.5} to outperform its tool-use-trained derivative, xLAM-2-32b-fc-r~\cite{prabhakar2026apigen_Salesforce_xLAM2}, while further improving xLAM itself. 
+
+Our contributions are threefold: 
+(1) We formulate \emph{harness-based runtime interface adaptation} for deterministic LLM agents, framing agent improvement as evolving the reusable interface between a frozen model and a rule-governed environment. 
+(2) We introduce \textbf{~\method}, a lifecycle-aware framework that converts recurring trajectory failures into targeted interventions across {environment contracts}, {procedural skills}, {action realization}, and {trajectory regulation}. 
+(3) We demonstrate broad \textbf{cross-model gains} across seven environments and 18 backbones, achieving an average relative improvement of \textbf{88\%} without updating model weights or modifying evaluation protocols.  
+Together, these results suggest that many practical agent failures can be addressed by evolving the \textbf{runtime interface} rather than modifying model parameters.
+\section{Related Work}
+
+\noindent \textbf{Harness Optimization.}
+A very recent line of work has begun to optimize the scaffold around frozen LLM systems.
+AutoTTS~\cite{zheng2026llms_AutoTTS_LLMs-Improving-LLMs} searches reasoning-time controllers for allocating width/depth computation in mathematical reasoning.
+Workspace Optimization~\cite{sarafian2026workspace_DREAMTEAM} and Continual Harness~\cite{karten2026continual_Continual-Harness} study online adaptation in interactive game-like environments, where agents revise workspace state, prompts, skills, memories, or executable artifacts from their own episode history.
+HARBOR~\cite{sengupta2026harbor_HARBOR} treats harness tuning as Bayesian optimization over pre-existing feature flags, while Meta-Harness~\cite{lee2026meta_Meta-harness} searches over complete harness programs using prior candidate code, scores, and execution traces.
+More recently, AHE~\cite{lin2026agentic} performs observability-driven evolution of coding-agent harnesses by exposing editable components as files, distilling trajectory evidence, and verifying edits through prediction manifests.
+
+\method{} shares the premise that frozen agents can be improved outside model weights, but targets a different scope and abstraction.
+Where Meta-Harness and AHE focus on automated harness engineering for coding agents, \method{} studies deterministic, rule-governed agent domains beyond coding, including household interaction, web shopping, database tasks, and policy-guided workflows.
+Rather than treating the harness as a free-form code artifact to be searched or continuously edited, \method{} treats it as a structured runtime interface whose adaptation is organized by the agent interaction lifecycle. Recurring training-trajectory failures are mapped to fixed interventions for environment contracts, procedural skills, action realization, and trajectory regulation; these interventions are then evaluated on unseen tasks and reused across model backbones.
+
+\noindent \textbf{Prompt Adaptation Methods.}
+Prompt optimization adapts frozen LLM systems by rewriting instructions, demonstrations, or prompt templates instead of model weights~\cite{agarwal2024promptwizard,fernando2023promptbreeder}.
+Representative methods include automatic prompt optimization, LLM-as-optimizer approaches such as OPRO~\cite{ORPO_yang2024large_Large-language-models-as-optimizers}, textual-gradient methods such as ProTeGi~\cite{pryzant2023automatic_ProTeGi_Automatic-prompt-optimization-with-gradient-descent-and-beam-search} and TextGrad~\cite{yuksekgonul2024textgrad_Textgrad-Automatic-differentiation-via-text}, and reflective optimizers such as GEPA~\cite{agrawal2025gepa_Gepa-Reflective-prompt-evolution-can-outperform-reinforcement-learning}.
+These methods are complementary to~\method{}: they optimize model-facing text, whereas~\method{} adapts the broader runtime interface, including prompt-facing contracts, action validation, feedback-driven recovery, and trajectory regulation.
+
+\noindent \textbf{Model-side Adaptation for LLM Agents.}
+Most agent adaptation work improves the model itself through instruction tuning~\cite{qwen2.5}, tool-use fine-tuning~\cite{prabhakar2026apigen_Salesforce_xLAM2}, reinforcement learning~\cite{guo2025deepseek_Deepseek-r1,xu2026cleaner,qian2026toolrl}, distillation~\cite{lu2025onpolicydistillation}, and related post-training methods~\cite{dubey2024llama,qwen3technicalreport,deepseekai2026deepseekv4,xiao2026mimo}.
+While such methods can substantially improve agent behavior, their adaptations remain tightly coupled to specific model checkpoints and training distributions. \method{} offers a complementary paradigm: it leaves model weights frozen and instead adapts the runtime interface through which the model observes and acts.
+
+\section{From Parameter Adaptation to Runtime Interface Adaptation}
+\label{sec:preliminaries}
+
+\subsection{LLM Agents as Runtime Systems}
+\label{subsec:agents-runtime}
+
+We formalize an LLM agent as a policy \(\pi_\theta\) interacting with a stateful environment, which may include both the environment \(E\) and a user \(U\). An episode is defined by a task \(x\), the combined environment \(E\) (including \(U\)), an environment contract \(C\), and a step budget \(B\). The contract \(C\) specifies the intended interaction protocol: available tools, argument and feedback formats, answer formats, and task-specific policies. The episode begins with
+\[
+    s_0, o_0 = E.\textsc{Init}(x),
+\]
+where \(s_0\) and \(o_0\) denote the initial state and observation. At step \(t\), the trajectory
+\[
+    \tau_t = (C, x, o_0, a_0, o_1, \ldots, a_{t-1}, o_t)
+\]
+contains the contract, task, past actions, and observations. The agent produces an action
+\[
+    a_t \sim \pi_\theta(\cdot \mid \tau_t),
+\]
+where \(a_t\) can be a tool call, text command, or final-answer submission. Text actions can be treated as pseudo-tools (e.g., \textsc{Act}, \textsc{SubmitAnswer}) for a unified notation. The environment processes the action:
+\[
+    s_{t+1}, o_{t+1} = E.\textsc{Step}(s_t, a_t),
+\]
+If \(a_t\) is unsupported or ineffective, the environment may return an error message; such feedback is still part of the interaction trajectory. The updated trajectory is
+\[
+    \tau_{t+1} = (C, x, o_0, a_0, \ldots, a_t, o_{t+1}),
+\]
+and the episode continues until task completion, environment termination, or step budget exhaustion.
+This runtime perspective emphasizes that performance depends not only on \(\pi_\theta\) but also on how outputs are mediated before and after execution, motivating explicit harness adaptation.
+
+\subsection{Parameter vs. Runtime Interface Adaptation}
+
+Conventional approaches adapt agents by updating model parameters from training trajectories:
+\[
+    \theta' \leftarrow \mathcal{A}_{\mathrm{param}}(\theta,\mathcal{T}_{\mathrm{train}}),
+\]
+absorbing task-specific structure into the weights. This \emph{parameter adaptation} is inherently \textbf{model- and task-specific}, and must be repeated when the base model changes or when deployed in new environments. 
+
+We study a complementary approach: keeping \(\theta\) fixed while adapting the runtime harness:
+\[
+    H' \leftarrow \mathcal{A}_{\mathrm{harness}}(H,\mathcal{T}_{\mathrm{train}}),
+    \qquad
+    \theta \text{ fixed}.
+\]
+The adapted harness \(H'\) changes how the model interacts with the environment, while leaving model weights and evaluation protocols unchanged. We term this \emph{runtime interface adaptation}, which is \textbf{environment-specific} but \textbf{model-agnostic}: a harness evolved for one environment generalizes to different model backbones that follow the same interaction protocol, without retraining.
+\section{Method: \method{} }
+\label{sec:method}
+
+We propose \method{}, an evolving lifecycle runtime harness for
+deterministic LLM agents. The harness adapts the model--environment interface
+rather than model weights. It operates on the interaction loop defined in
+Section~\ref{subsec:agents-runtime}: the environment contract \(C\), the task
+description \(x\), the environment state \(s_t\), the model action \(a_t\), and
+the trajectory \(\tau_t\).
+\subsection{Failure Diagnosis}
+\label{sec:failure-diagnosis}
+\begin{figure}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/failure_analysis.pdf}
+    \caption{Failure diagnosis on training tasks.}
+    \label{fig:failure}
+\end{figure}
+\begin{figure*}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/method.pdf}
+    \caption{
+    Overview of \method{}. The harness adapts the model-environment
+    interface through four lifecycle layers spanning before interaction, task
+    conditioning, before environment execution, and after execution.
+    }
+    \label{fig:method}
+\end{figure*}
+Before designing the harness, we first diagnose the primary failure modes of baseline agents. We evaluate a frozen Qwen3-4B-Instruct on training tasks across diverse interactive agent environments, and manually inspect failed trajectories. For each failed episode, we assign a primary failure type according to the earliest dominant bottleneck in the agent--environment loop, following the classification rules detailed in Appendix~\ref{app:failure-taxonomy}. The resulting taxonomy is summarized in Figure~\ref{fig:failure}. We identify four recurring categories. \textbf{Action realization failures} occur when the model's intent is plausible but not expressed in an environment-executable form, such as free-form actions or missing arguments. \textbf{Environment contract mismatches} occur when an action is syntactically executable but violates the intended tool usage or calling protocol. \textbf{Trajectory degeneration} occurs when individual actions are valid, but the episode falls into repetition, stagnation, or ineffective recovery. The remaining \textbf{general reasoning failures} arise from incorrect inference, computation, or decision-making despite largely following the protocol.
+
+As shown in Figure~\ref{fig:failure}, deterministic agent failures are heterogeneous: all four categories occur in practice, and the dominant mode varies substantially across environments. 
+This motivates a harness with multiple intervention points, spanning environment-contract clarification, procedural retrieval, pre-execution action validation, and post-execution trajectory regulation.
+
+\subsection{Overview}
+\label{sec:method-overview}
+
+Guided by the failure diagnosis above, \method{} comprises four layers integrated across different stages of the agent lifecycle. Figure~\ref{fig:method} provides an overview of \method{}.
+
+\ding{182} \textbf{Environment Contract Layer} operates before interaction. It makes stable environment constraints explicit, including tool-use rules, policy constraints, and common pitfalls that agents frequently encounter in the target environment.
+
+\ding{183} \textbf{Procedural Skill Layer} operates at the task-conditioning stage. It maintains a skill library distilled from training trajectories and retrieves relevant skills based on the user's task description. This layer provides non-parametric guidance for general decision-making.
+
+\ding{184} \textbf{Action Realization Layer} operates after the model outputs an action and before the environment executes it. It verifies whether the action is executable under the environment contract, canonicalizes unambiguous interface-level errors, and blocks actions that would deterministically fail. This layer ensures that the model's intended operation is reliably mapped to a valid tool call or environment action.
+
+\ding{185} \textbf{Trajectory Regulation Layer} operates after environment
+feedback is returned. It monitors the updated trajectory for non-progressing patterns such as repetition, stagnation, or budget exhaustion, and triggers recovery when needed. This layer specifically targets trajectory degeneration.
+
+Together, these layers adapt the runtime interface through which the model
+interacts with the environment. The model weights remain fixed, and the
+evaluation environment is unchanged.
+
+\subsection{Detailed Design of \method}
+
+\subsubsection{Environment Contract Layer}
+\label{sec:h3}
+
+This layer makes stable environment constraints explicit before interaction by adapting the model-visible contract \(C\). Formally, it produces an enhanced contract $C' = C \oplus \Delta_C$, where \(\Delta_C\) contains concise updates derived from environment policies,
+API behavior, and recurring failures in training trajectories. The enhanced contract \(C'\) is shown to the model in place of \(C\), enabling the agent to better utilize the given tools.
+In practice, \(\Delta_C\) may specify how tools should be called, which actions are admissible under the environment protocol, and which environment-specific pitfalls should be avoided.
+
+\subsubsection{Procedural Skill Layer}
+\label{sec:h5}
+
+This layer provides non-parametric guidance from training
+trajectories. A skill is a compact and reusable strategy that captures the essence of how to accomplish specific subtasks.
+
+Let \(\mathcal{S}\) be the skill memory constructed from training trajectories.
+For a task description \(x\), the harness retrieves relevant skills:
+\[
+    \mathcal{K}_x =
+    \operatorname{TopK}_{k \in \mathcal{S}}
+    \operatorname{score}(x,k),
+\]
+where \(\operatorname{score}\) is implemented with BM25 in our experiments. The
+retrieved skills \(\mathcal{K}_x\) are inserted into the initial system prompt to guide the model on how to solve specific common problems.
+
+\subsubsection{Action Realization Layer}
+\label{sec:h2}
+
+This layer operates after the model outputs an action and
+before the environment executes it. Given the model action \(a_t\), the current
+trajectory \(\tau_t\), and the current state \(s_t\), the
+layer either submits this action \( a_t\) to the environment or
+returns a model-visible block message \(m_t\):
+\begin{align*}
+    &z_t =
+    \textsc{RealizeAction}(a_t, \tau_t, s_t)\\
+    &z_t \in \{\textsc{EXEC}(a_t), \textsc{Block}(m_t)\}.
+\end{align*}
+It uses deterministic environment evidence, such as tool schemas, admissible action sets, argument constraints, and task policies, to enforce the prevention of erroneous tool calls at the execution level.
+
+\subsubsection{Trajectory Regulation Layer}
+\label{sec:h4}
+
+The Trajectory Regulation Layer monitors the interaction after environment
+execution. Many agent failures are self-reinforcing: the agent repeats the same invalid command, loops between equivalent states, or exhausts the budget without making progress. Such failures are often detectable from trajectory-level patterns rather than deep semantic understanding.
+Given the executed action, returned observation, remaining budget, and
+environment evidence, the layer computes:
+\[
+    r_t =
+    \textsc{RegulateTrajectory}(\tau_t,a_t,o_{t+1},b_t)
+\]
+where \(b_t=B-t-1\) is the remaining budget. The output \(r_t\) may be empty, a soft recovery message, a warning regarding repeated failures, or a stronger corrective directive when the trajectory exhibits clear signs of degradation.
+
+The four layers act at complementary stages of the agent lifecycle: contract calibration before interaction, skill retrieval during task conditioning, action realization before execution, and trajectory regulation after execution, adapting the runtime interface between model and environment without changing model weights, the environment, or the evaluation protocol. The full \method~algorithm is shown in Algorithm~\ref{alg:life}.
+
+\begin{algorithm}[t]
+    \caption{\method{} loop}
+    \label{alg:life}
+    \small
+    \KwIn{task \(x\), environment \(E\), contract \(C\), budget \(B\)}
+    \(C' \leftarrow \textsc{EnvContract}(C)\), 
+    \(x' \leftarrow \textsc{SkillLayer}(x)\)\;
+    \(s_0,o_0 \leftarrow E.\textsc{Init}(x')\), 
+    \(\tau_0 \leftarrow (C',x',o_0)\)\;
+    \For{\(t=0,\ldots,B-1\)}{
+        \(a_t \leftarrow \textsc{LLM}(\tau_t)\)\;
+        \(z_t \leftarrow \textsc{RealizeAction}(a_t,\tau_t,C',s_t)\)\;
+        \((s_{t+1},o_{t+1}) \leftarrow 
+        \textsc{ExecuteOrBlock}(E,s_t,z_t)\)\;
+        \(\tau_{t+1} \leftarrow \tau_t \oplus (z_t,o_{t+1})\)\;
+        \(\tau_{t+1} \leftarrow 
+        \textsc{RegulateTrajectory}(\tau_{t+1},C',s_{t+1})\)\;
+        \If{\textsc{IsEnd}\((s_{t+1},o_{t+1})\)}{\textbf{break}}
+    }
+\end{algorithm}
+
+\subsection{Trajectory-Driven Harness Evolution}
+\label{sec:harness-construction}
+
+\method{} is evolved from training trajectories with the assistance of a coding
+agent, Codex~\cite{openai2026codexcli}. We repeatedly execute a frozen model on the training tasks to collect complete interaction traces. The coding agent then reads these traces together with the harness design criteria and proposes updates to the corresponding layers. The objectives are twofold: (1) to extend harness coverage for recurring failure patterns, and (2) to detect regression cases where interventions may over-trigger or compromise otherwise correct behavior. The prompts used for harness evolution and the final harness generated by each task are provided in the Appendix~\ref{app:evolution-prompts}.
+
+\section{Experiments}
+\subsection{Experimental Setup}
+\label{sec:exp-setup}
+
+\textbf{Benchmarks.}
+We evaluate \method{} on three benchmark suites: \(\tau\)-bench~\cite{yao2024tau_tau-bench},
+\(\tau^2\)-bench~\cite{barres2025tau_tau2-bench}, and AgentBench~\cite{liu2024agentbench}, covering seven task scenarios:
+{Airline}, {Retail}, {Telecom}, {ALFWorld}~\cite{shridhar2020alfworld},
+{WebShop}~\cite{yao2022webshop}, {OS}, and {DBBench}. These benchmarks share the properties central to our setting: \textbf{stable environments and deterministic tasks}, making the runtime harness a high-leverage target for
+adaptation.
+
+\noindent \textbf{Models.}
+We use Qwen3-4B-Instruct~\cite{qwen3technicalreport} as the source model for harness evolution.
+Specifically, we run it on training tasks, collect trajectories, and use a
+coding agent, Codex~\cite{openai2026codexcli}, to inspect traces and iteratively update the harness. \textbf{In the harness evolve process, the test set is always hidden to ensure generalization.} The final evolved harness is then frozen and reused for evaluating 17 additional open-source model backbones. Our model set covers Qwen-family
+models~\cite{qwen2.5,qwen3technicalreport,qwen3.5}, Llama-family models~\cite{dubey2024llama}, and xLAM-family models~\cite{prabhakar2026apigen_Salesforce_xLAM2},
+including instruction-tuned models, reasoning models, and models post-trained for agentic benchmarks.
+
+\noindent \textbf{Evaluation Parameters.}
+All evaluations use a sampling temperature of \(0.0\). For \(\tau\)-bench and
+\(\tau^2\)-bench, we use DeepSeek-V4-Flash~\cite{deepseekai2026deepseekv4} as the user LLM and evaluate
+each task three times, reporting both single-run success and Pass\textasciicircum{}3, where
+Pass\textasciicircum{}3 requires all three runs to succeed. For AgentBench, each task is
+evaluated once following the official implementation. More detailed per-task configurations are provided in
+Appendix~\ref{app:exp}.
+\subsection{Main Results}
+\begin{table}[t]
+    \centering
+    \huge
+    \setlength{\tabcolsep}{4pt}
+    \resizebox{1.0\linewidth}{!}{
+    \begin{tabular}{ccccccc}
+    \toprule
+    \textbf{Suite} & \textbf{Benchmark} & \textbf{Metric}
+    & \textbf{w/o} & \textbf{w/ \method}
+    & \textbf{Rel. Gain} & \textbf{Improved} \\
+    \midrule
+    \multirow{4}{*}{AgentBench}
+    & ALFWorld & \multirow{4}{*}{Pass@1} & 41.1\% & \textbf{75.7\%} & +84\% & 17/18 \\
+    & WebShop  &  & 31.4\% & \textbf{44.0\%} & +40\% & 18/18 \\
+    & OS       &  & 34.7\% & \textbf{41.2\%} & +19\% & 18/18 \\
+    & DBBench  &  & 48.4\% & \textbf{64.6\%} & +34\% & 18/18 \\
+    \midrule
+    \multirow{4}{*}{$\tau$-bench}
+    & \multirow{2}{*}{Airline}
+        & Pass@1 & 49.7\% & \textbf{62.6\%} & +26\% & 16/18 \\
+    &   & Pass\textasciicircum{}3 & 34.7\% & \textbf{52.2\%} & +50\% & 17/18 \\
+    & \multirow{2}{*}{Retail}
+        & Pass@1 & 56.2\% & \textbf{61.8\%} & +10\% & 14/18 \\
+    &   & Pass\textasciicircum{}3 & 37.9\% & \textbf{45.3\%} & +19\% & 15/18 \\
+    \midrule
+    \multirow{2}{*}{$\tau^2$-bench}
+    & \multirow{2}{*}{Telecom}
+        & Pass@1 & 55.3\% & \textbf{69.0\%} & +25\% & 17/18 \\
+    &   & Pass\textasciicircum{}3 & 41.5\% & \textbf{52.6\%} & +27\% & 18/18 \\
+    \bottomrule
+    \end{tabular}
+    }
+    \caption{
+    Main results averaged over 18 model backbones.
+    }
+    \label{tab:exp_main}
+\end{table}
+\begin{figure}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/exp_heatmap.pdf}
+    \caption{Absolute performance improvement across 18 model backbones and 7 benchmarks.}
+    \label{fig:exp_heatmap}
+\end{figure}
+\begin{figure}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/exp_evolve.pdf}
+    \caption{Training set performance improves steadily as the number of evolutionary iterations increases.}
+    \label{fig:exp_evolve}
+\end{figure}
+\textbf{Performance Gains of~\method{}.}
+Table~\ref{tab:exp_main} reports the performance improvements brought by~\method{} across all benchmarks, averaged over 18 models, while Figure~\ref{fig:exp_heatmap} provides a model-by-benchmark breakdown over the 18 models and 7 benchmarks. 
+We make two observations. 
+\textbf{\underline{1)}} \method{} consistently improves performance on all benchmarks, achieving relative gains of $10\sim 84\%$. 
+With the evolved runtime harness, smaller models can become competitive with substantially larger baselines. 
+\textbf{\underline{2)}} Although~\method{} is evolved only from Qwen3-4B-Instruct trajectories, it generalizes broadly across other backbones: 92\% of all model--benchmark settings improve, covering instruct models, reasoning models, and models trained specifically for agentic tasks. 
+These results suggest that~\method{} captures reusable environment-side structure rather than model-specific behavior. Complete experimental results are provided in Table~\ref{tab:appendix-full-results}.
+\begin{figure}[!tb]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/exp_prompt.pdf}
+    \caption{Comparison with prompt evolving method.}
+    \label{fig:exp_prompt}
+\end{figure}
+\begin{table}[!tb]
+    \centering
+    \huge
+    \setlength{\tabcolsep}{4.5pt}
+    \resizebox{1.0\linewidth}{!}{
+    \begin{tabular}{lccc|cccc}
+    \toprule
+    \multirow{2}{*}{\textbf{Setting}}
+    & \multicolumn{2}{c}{\textbf{$\tau$-bench}}
+    & $\tau^2$-bench
+    & \multicolumn{4}{c}{\textbf{AgentBench}} \\
+    \cmidrule(lr){2-3} \cmidrule(lr){4-4} \cmidrule(lr){5-8}
+    & \textbf{Airline} & \textbf{Retail} & \textbf{Telecom} & \textbf{ALFWorld} & \textbf{WebShop} & \textbf{OS} & \textbf{DBBench} \\
+    \midrule
+    \method
+        & 0.0\% & 0.0\% & 0.0\% & 0.0\% & 0.0\% & 0.0\% & 0.0\% \\
+    w/o Contract & -8.3\% & -17.5\% & -16.0\% & -1.0\% & -4.4\% & -14.1\% & -16.9\% \\
+    w/o Skill & -8.3\% & -15.9\% & -17.4\% & -1.0\% & -2.2\% & -14.1\% & -3.1\% \\
+    w/o Action & -61.7\% & -15.9\% & -10.1\% & -1.0\% & -6.6\% & -59.6\% & -4.6\% \\
+    w/o Trajectory & -3.3\% & -16.7\% & -36.2\% & -86.5\% & -26.4\% & -14.1\% & -4.6\% \\
+    \bottomrule
+    \end{tabular}
+    }
+    \caption{
+    Leave-one-layer-out ablation on Qwen3-4B-Instruct. Values report the relative \textbf{accuracy drop} compared with the full \method. ``Contract'', ``Skill'' ``Action'', and ``Trajectory'' denote the Environment Contract, Procedural Skill, Action Realization and Trajectory Regulation layers, respectively.
+    }
+    \label{tab:ablation}
+\end{table}
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=1.0\linewidth]{imgs/exp_ablation2.pdf}
+    \caption{Comparison between specialized tool-use training and runtime harnessing.
+    Harnessing can outperform tool-use training without updating model weights, remains useful after training, and mitigates the limited OOD transfer of specialized training.}
+    \label{fig:exp_ablation2}
+\end{figure*}
+
+\noindent \textbf{Evolution Dynamics}. 
+Figure~\ref{fig:exp_evolve} shows the training-set performance of Qwen3-4B-Instruct as \method{} is iteratively evolved on each task. Performance improves steadily over evolution rounds and eventually saturates, suggesting that iterative harness evolution is both practical and efficient. The rapid convergence also reflects the benefit of the four-layer design, where updates are localized to identifiable failure modes instead of rewriting the harness as an unconstrained whole~\cite{lee2026meta_Meta-harness,lin2026agentic}.
+
+\noindent \textbf{Comparison with Prompt Evolving}. 
+Figure~\ref{fig:exp_prompt} compares \method{} with prompt-only evolving~\cite{agrawal2025gepa_Gepa-Reflective-prompt-evolution-can-outperform-reinforcement-learning,ORPO_yang2024large_Large-language-models-as-optimizers}, which iteratively optimizes only the input prompt. While prompt-only evolving provides modest gains, \method{} achieves substantially higher Pass@1 performance, adding an average relative improvement of 120\%. This gap highlights a key property of agentic tasks: performance depends not only on the initial prompt, but also on how the runtime mediates tools, actions, feedback, and multi-step trajectories.
+
+\subsection{Ablation Study}
+\noindent \textbf{All Lifecycle Layers Matter}. Table~\ref{tab:ablation} shows the leave-one-layer-out ablation results of \method. The results demonstrate that all four layers in \method~are indispensable: removing any layer leads to substantial performance drops on some datasets. Moreover, different tasks benefit from different layers, reflecting the distinct characteristics of their task environments.
+
+\noindent \textbf{Does Model Training Remove the Need for Harnessing?}
+Figure~\ref{fig:exp_ablation2} compares specialized tool-use training with~\method{}. 
+We use xLAM-2-32B as a representative trained model, which is initialized from Qwen2.5-32B-Instruct and further trained on tool-use scenarios related to \(\tau\)-bench. 
+The results show three patterns. 
+\textbf{\underline{1)}} Harnessing can outperform specialized training without weight updates: Qwen2.5-32B equipped with~\method{} surpasses xLAM-2-32B by 7.5 percentage points on the in-domain \(\tau\)-bench setting. 
+\textbf{\underline{2)}} Harnessing remains beneficial after training: applying~\method{} to xLAM improves all evaluated benchmark groups by $6.8\sim 28.9$ percentage points. 
+\textbf{\underline{3)}} Specialized tool-use training does not necessarily transfer to out-of-domain (OOD) agent environments: on \(\tau^2\)-bench and AgentBench, xLAM underperforms its base Qwen2.5 model, suggesting reduced OOD generalization. 
+We observe the same trend for xLAM-2-8B, trained from Llama-3.1-8B-Instruct.
+
+These results suggest that training and harnessing adapt different parts of an agent system: training tunes model parameters to a source distribution, whereas~\method{} adapts the runtime interface to a target deterministic environment. 
+Thus, harnessing targets reusable environment-side structure and remains model-agnostic and complementary to model training.
+\section{Conclusion}
+We present \method{}, a lifecycle-aware runtime harness for deterministic LLM agents. 
+Rather than updating model parameters, \method{} evolves reusable interface interventions from training trajectories, spanning environment contracts, procedural skills, action realization, and trajectory regulation. 
+Across seven environments and 18 model backbones, \method{} achieves broad performance gains while keeping both model weights and evaluation environments fixed. 
+These results suggest that many agent failures can be mitigated by adapting the runtime interface between frozen LLMs and rule-governed environments, providing a complementary alternative to model-centric agent training.
+
+\section*{Limitations}
+
+This work focuses on deterministic, rule-governed agent environments where the tool interface, feedback rules, and evaluation criteria are relatively stable. 
+This setting is common in database manipulation, web shopping, and policy-guided business workflows, and it enables failures to be reproduced and converted into reusable harness interventions. 
+Related prior work on runtime harnessing has also primarily focused on coding or text-based agents, where the interface and task structure are well-defined~\cite{lee2026meta_Meta-harness,lin2026agentic}. 
+However, extending the same idea to fully open-ended agent tasks remains challenging. 
+In open-domain settings~\cite{ye2026claw}, each task may involve different goals, tools, external resources, and success criteria, making it harder to define a stable runtime interface or evolve a harness that generalizes across arbitrary tasks. 
+We consider harness construction in such open-ended environments to be an important avenue for future research.
+
+\appendix
+\section{Detailed Harness}
+\subsection{Failure Annotation Protocol}
+\label{app:failure-taxonomy}
+
+We annotate failed trajectories with the help of a coding agent, Codex~\cite{openai2026codexcli}. For each failed episode, Codex reads the complete interaction trace and assigns one primary failure category according to the rule-based protocol below. The classification is performed trajectory by trajectory, rather than from aggregate statistics. We use a priority-based protocol: the annotator first checks for action realization failures, then environment contract mismatches, then trajectory degeneration, and finally assigns the episode to the residual category. This priority order prevents later symptoms from hiding earlier interface failures. For example, if an agent writes a tool call in plain text, the environment never executes it, and the episode eventually exhausts the step budget, we annotate it as an action realization failure rather than trajectory degeneration.
+
+\paragraph{Action realization failures.}
+This category corresponds to failures targeted by the \emph{Action Realization Layer}. A failed episode is assigned to this category if any of the following conditions hold:
+\begin{itemize}
+    \item The assistant does not produce executable \texttt{tool\_calls}, but instead writes in \texttt{content} an action or answer that should have been submitted through a tool, such as \texttt{take\_action(\{...\})}, \texttt{answer\_action(\{...\})}, a natural-language command, SQL text, or the final answer text.
+    \item The assistant produces a tool call, but the call cannot be executed because of an invalid function name, JSON parsing failure, missing required arguments, or incorrect argument types.
+    \item In DBBench, the SQL query is not executable due to interface, dialect, or formatting violations, such as unquoted column names containing spaces, malformed table names, or invalid concatenation syntax.
+\end{itemize}
+The key criterion is that the model's intent may be reasonable, but it is not submitted in a form executable by the environment.
+
+\paragraph{Environment contract mismatches.}
+This category corresponds to failures targeted by the \emph{Environment Contract Layer}. It is considered only when the action interface is executable. A failed episode is assigned to this category if any of the following conditions hold:
+\begin{itemize}
+    \item The agent uses the wrong tool for a critical step, such as calling a finish tool when an answer-submission tool is required.
+    \item The tool choice or calling order violates the task protocol, such as submitting prematurely, skipping a required intermediate tool, or using a search tool to encode constraints that should not be searched directly.
+    \item The argument has an incorrect semantic format, although it satisfies the JSON or schema-level interface. For example, in DBBench, the final answer may be required to be an exact value or list, but the agent submits a natural-language explanation, or multi-column results are concatenated into free-form text instead of the required format.
+\end{itemize}
+The key criterion is that the function call is structurally present and executable, but the agent misunderstands the tool's purpose, boundary, calling protocol, or argument semantics.
+
+\paragraph{Trajectory degeneration.}
+This category corresponds to failures targeted by the \emph{Trajectory Regulation Layer}. It is considered only when neither action realization nor environment contract mismatch is the primary cause. A failed episode is assigned to this category if any of the following conditions hold:
+\begin{itemize}
+    \item The episode ends due to \texttt{task limit reached} or an equivalent budget-exhaustion signal, and the trajectory contains a clear repetition pattern, such as repeatedly issuing the same action, oscillating between two states, repeatedly calling \texttt{look}, \texttt{inventory}, or \texttt{examine}, repeatedly searching or clicking, or repeatedly returning to the same page.
+    \item The agent commits to an incorrect strategy early and reinforces it throughout the trajectory, such as searching once and purchasing without comparing candidates or required attributes, or repeatedly visiting already explored locations after failing to find the target.
+    \item The environment repeatedly returns no-progress feedback, such as \texttt{Nothing happens} or an unchanged page/state over many steps.
+\end{itemize}
+The key criterion is that individual actions are usually executable, but the long-horizon interaction fails to use environment feedback to revise the strategy.
+
+\paragraph{Residual reasoning failures.}
+A failed episode is assigned to this category when none of the above categories apply. This category includes cases where the tool-use protocol is largely followed, but the agent makes an incorrect reasoning, computation, SQL, retrieval, or value-selection decision. It also includes cases where the agent retrieves the wrong object or answer for reasons not attributable to tool-protocol misunderstanding or trajectory loops, or where the correct task path is attempted but the final value, condition, or filtering logic is wrong.
+
+\subsection{Harness Evolution Prompt}
+\label{app:evolution-prompts}
+
+We use a coding agent Codex~\cite{openai2026codexcli} to evolve \method{} from training trajectories. The agent is
+given: (1) the current harness implementation, (2) a directory containing
+training trajectories and summary metrics from the previous iteration, and
+(3) a design guide describing the four lifecycle layers. The prompt used for harness evolution is shown below.
+
+\begin{tcolorbox}[
+    colback=gray!3,
+    colframe=gray!45,
+    title={Prompt Template for Trajectory-Driven Harness Evolution},
+    fonttitle=\bfseries,
+    breakable,
+    enhanced,
+    boxrule=0.6pt,
+    arc=2pt,
+    left=5pt,
+    right=5pt,
+    top=5pt,
+    bottom=5pt
+]
+\textbf{System Instruction.}
+
+You are a coding agent responsible for improving a runtime harness for a
+deterministic LLM-agent environment. Your goal is to improve task performance by
+adapting the runtime interface between the frozen model and the environment,
+without changing the model weights, the benchmark tasks, or the environment
+evaluation logic.
+
+\vspace{0.5em}
+\textbf{Inputs.}
+You are given:
+\begin{itemize}
+    \item the current harness implementation: \texttt{\{HARNESS\_DIR\}};
+    \item a trajectory directory from the previous iteration, including the summary metrics:
+    \texttt{\{TRAJECTORY\_DIR\}};
+    \item the harness design guide:
+    \texttt{\{DESIGN\_GUIDE\}}. (The following content may either be included in this file or provided directly to the model.)
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Harness Design Principles.}
+The harness has four lifecycle layers:
+\begin{enumerate}
+    \item \textbf{Environment Contract Layer}: clarify stable tool, action, policy, and answer-format constraints before interaction.
+    \item \textbf{Procedural Skill Layer}: retrieve compact procedural skills distilled from training trajectories and align them with the current task state.
+    \item \textbf{Action Realization Layer}: validate model-generated actions before execution, canonicalize unambiguous interface-level errors, and block actions that would deterministically fail.
+    \item \textbf{Trajectory Regulation Layer}: monitor post-execution
+    trajectories, detect repeated failures or non-progressing behavior, and trigger recovery when needed.
+\end{enumerate}
+
+Use these layers to address runtime-interface failures, not to solve tasks with
+hidden oracle information. The harness may expose stable environment-side
+structure, but it must not use test labels, modify benchmark tasks, alter
+environment transitions, or change evaluation criteria.
+
+\vspace{0.5em}
+\textbf{Analysis Requirements.}
+Inspect the previous iteration's trajectories and identify recurring failure
+patterns. For each pattern, determine the earliest lifecycle point where it can
+be reliably detected or prevented:
+\begin{itemize}
+    \item before interaction, via contract clarification;
+    \item during task conditioning, via procedural skill retrieval;
+    \item before environment execution, via action validation or canonicalization;
+    \item after execution, via trajectory monitoring and recovery.
+\end{itemize}
+
+Focus on failures that are mechanically identifiable from deterministic
+environment signals, such as invalid action formats, wrong tool conventions,
+missing required fields, repeated no-op actions, loops, premature submissions,
+budget exhaustion, or recurring procedural mistakes.
+
+\vspace{0.5em}
+\textbf{Update Requirements.}
+Propose and implement targeted updates to the appropriate harness layer. Each
+update should satisfy the following constraints:
+\begin{itemize}
+    \item it should be triggered by precise environment or trajectory evidence;
+    \item it should be as local and minimal as possible;
+    \item it should not override model reasoning when the correct action is
+    ambiguous;
+    \item it should preserve the original environment and evaluation protocol;
+    \item it should be robust to unseen tasks from the same environment.
+\end{itemize}
+
+\vspace{0.5em}
+\textbf{Regression Check.}
+After implementing updates, inspect cases where the harness may over-trigger,
+block a valid action, inject misleading guidance, or reduce performance on
+previously successful trajectories. Revise the harness if any layer introduces
+negative side effects.
+
+\vspace{0.5em}
+\textbf{Output.}
+Return:
+\begin{enumerate}
+    \item a concise summary of the dominant failure patterns found;
+    \item the harness layer responsible for each proposed update;
+    \item the implemented code changes;
+    \item a short explanation of why each update is safe under the deterministic
+    environment contract;
+    \item any remaining failure modes that should be monitored in the next
+    iteration.
+\end{enumerate}
+\end{tcolorbox}
+
+\subsection{Final Evolved Harness Inventory}
+\label{app:harness-inventory}
+
+This appendix summarizes the concrete harness components used in the seven evaluated scenarios. The inventory follows the four lifecycle layers described in the main method section. Detailed implementations of these components are provided in our submitted codebase: \href{https://github.com/Tianshi-Xu/Life-Harness}{GitHub}. The $\tau$-bench and $\tau^2$-bench harness components are listed in Table~\ref{tab:taubench-inventory}, and the AgentBench components are listed in Table~\ref{tab:agentbench-inventory} and Table~\ref{tab:agentbench-inventory-os-db}.
+
+\begin{table*}[t]
+    \centering
+    \huge
+    \setlength{\tabcolsep}{4pt}
+    \resizebox{1.0\linewidth}{!}{
+    \begin{tabular}{c|c|c|c|c|c}
+    \toprule
+    \textbf{Task} & \textbf{Raw Train Pool} & \textbf{Train Used for Harness Evolution} 
+    & \textbf{Test / Eval} & \textbf{Raw Pool Total} \\
+    \midrule
+    ALFWorld       & 3,150 & 100 & 109 & 3,259 \\
+    DBBench        & 4,803 & 100 & 300 & 5,103 \\
+    OS Interaction & 1,000 & 100 & 144 & 1,144 \\
+    WebShop        & 9,000 & 100 & 200 & 9,200 \\
+    Airline        & 30    & 30  & 20  & 50    \\
+    Retail         & 74    & 74  & 40  & 114   \\
+    Telecom        & 74    & 74  & 40  & 114   \\
+    \bottomrule
+    \end{tabular}
+    }
+    \caption{
+    Dataset statistics for harness evolution and evaluation.
+    }
+    \label{tab:data_statistics}
+\end{table*}
+
+\begin{table}[t]
+    \centering
+    \caption{Evaluation sampling and interaction-budget settings.}
+    \label{tab:eval-config}
+    \resizebox{1.0\linewidth}{!}{
+    \begin{tabular}{lccc}
+    \toprule
+    Benchmark & Temperature & Max tokens per step & Max step \\
+    \midrule
+    ALFWorld & $0.0$ & 4096 & 50 \\
+    DBBench &  $0.0$ & 4096 & 15 \\
+    OS &  $0.0$ & 4096 & 8 \\
+    WebShop &  $0.0$ & 4096 & 20 \\
+    Airline &  $0.0$ & 2048 & 200 \\
+    Retail &  $0.0$ & 2048 & 200 \\
+    Telecom &  $0.0$ & 2048 & 200 \\
+    \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+\begin{table*}[t]
+\centering
+\huge
+\scriptsize
+\setlength{\tabcolsep}{2.2pt}
+\renewcommand{\arraystretch}{0.88}
+\begin{tabular}{>{\centering\arraybackslash}m{0.1\textwidth}>{\centering\arraybackslash}m{0.2\textwidth}p{0.7\textwidth}}
+\toprule
+Domain & Layer & Implemented harness content \\
+\midrule
+\multirow{26}{*}{\centering Airline}
+& \multirow{6}{*}{Environment Contract Layer}
+& search tools remind that flight search takes only origin, destination, and date;
+search results must be compared by requested cabin price, total travel time, and
+seat availability; cancellation tool lists the four valid cancellation conditions
+and transfers flying/landed flights to humans; update tool requires complete
+round-trip itineraries and reservation-wide cabin changes; booking tool states
+payment-method caps, five-passenger cap, bookable-flight status, insurance, and
+baggage allowance rules; certificate tool states eligibility, amount cap, and
+compensation timing; transfer tool lists the cases that are actually out of
+scope. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Procedural Skill Layer}
+& communicate exact charge/refund after every cancel, update, or booking write;
+when multiple reservations exist, inspect candidate reservation details before
+acting; use at most one certificate per reservation and split only when separate
+bookings still satisfy the user request; submit all outbound and return legs in
+one round-trip update; check booking time, airline cancellation, business cabin,
+and insurance before cancellation; calculate total card charge or budget impact
+before writing; scan all reservations for duplicate, same-day, or schedule-mixup
+requests. \\
+\cmidrule(lr){2-3}
+& \multirow{8}{*}{Action Realization Layer}
+& \texttt{book\_reservation} checks duplicate payment IDs, at most one certificate, one
+credit card, and three gift cards; \texttt{book\_reservation} checks max five passengers,
+connected itinerary, available flight status, enough seats, correct baggage fee,
+and exact payment total; \texttt{cancel\_reservation} checks flown-flight guard and the
+four cancellation conditions; \texttt{update\_reservation\_flights} blocks basic-economy
+flight changes, origin/destination/trip-type changes, missing return legs,
+post-departure cabin changes, certificates as payment, and insufficient gift-card
+capacity; \texttt{update\_reservation\_baggages} blocks baggage decreases and wrong
+nonfree-bag count; \texttt{update\_reservation\_passengers} blocks passenger-count changes;
+\texttt{send\_certificate} checks user eligibility, real delayed/cancelled flight status,
+prior change/cancel for delay compensation, and amount multiple/cap. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Trajectory Regulation Layer}
+& \texttt{get\_user\_details} appends one-line summaries for every reservation when a user
+has several; \texttt{get\_reservation\_details} appends total paid by payment method,
+membership, insurance, cabin, passenger count, free-bag allowance, and current
+round-trip legs; \texttt{cancel\_reservation} appends exact refund amount and destination
+payment instrument; \texttt{update\_reservation\_flights} appends exact extra charge or
+refund; \texttt{book\_reservation} appends total charged by payment instrument. \\
+\midrule
+\multirow{30}{*}{\centering Retail}
+& \multirow{8}{*}{Environment Contract Layer}
+& \texttt{cancel\_pending\_order} description says the tool cancels the whole pending order
+and accepts only \texttt{no longer needed} or \texttt{ordered by mistake};
+\texttt{modify\_pending\_order\_items} description says item modification is once per pending
+order and replacement IDs must be same-product, different, and available;
+\texttt{modify\_pending\_order\_payment} description requires a saved payment ID and enough
+gift-card balance for the full positive total; address tools distinguish profile
+address from order shipping address; exchange/return descriptions say one return
+or exchange per delivered order and exact item IDs from order details; return
+description clarifies \texttt{available=false} does not block returning an owned
+item; transfer description lists only out-of-scope cases. \\
+\cmidrule(lr){2-3}
+& \multirow{6}{*}{Procedural Skill Layer}
+& count every variant with \texttt{available=true} for availability-count tasks;
+copy hidden target addresses from profile or previous orders before writing;
+for pending orders, do not use full-order cancellation when the user rejects that
+fallback; for bulk requests, inspect all candidate orders and group writes by
+order; exchange all requested items from the same delivered order in one call;
+compare numeric option values such as storage, zoom, size, or piece count; keep
+theme-scoped requests limited to matching items; use item modification, not a new
+order, for pending same-product replacements; after clear user confirmation,
+call the write tool instead of summarizing again. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Action Realization Layer}
+& \texttt{cancel\_pending\_order} checks order status and reason; \texttt{modify\_pending\_order\_items}
+checks status, once-only modification, non-empty \texttt{item\_ids}, non-empty
+\texttt{new\_item\_ids}, equal list lengths, old item IDs in the order, duplicate
+IDs against order quantity, replacement IDs in the catalog, same-product
+replacement, and not replacing with the same item; \texttt{modify\_pending\_order\_payment}
+checks new method differs and gift card covers the full total; \texttt{exchange\_delivered\_order\_items}
+checks delivered status, one exchange/return only, valid old/new IDs, duplicate
+old IDs, same-product replacement, and not same item; \texttt{return\_delivered\_order\_items}
+checks delivered status, valid return items, duplicate return IDs, and refund to
+original method or user's gift card. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Trajectory Regulation Layer}
+& \texttt{get\_order\_details} appends status-specific routing, in-progress return/exchange
+or already-modified warnings, tracking numbers, and order total; \texttt{get\_product\_details}
+appends available variant count, cheapest/most-expensive available variants, and
+numeric option min/max summaries; \texttt{get\_item\_details} explains that out-of-stock
+only blocks new purchases, not returns/exchanges of owned items; exchange writes
+append price difference; return writes append refund amount and remaining-item
+total when relevant; cancel writes append refund amount; gift-card write paths
+can append updated gift-card balance; completion annotators mention other
+eligible orders only as conditional follow-up, not as permission to act. \\
+\midrule
+\multirow{28}{*}{\centering Telecom}
+& \multirow{6}{*}{Environment Contract Layer}
+& \texttt{send\_payment\_request} description says use it only for overdue bills and only
+one awaiting-payment bill at a time; \texttt{resume\_line} description says all overdue
+bills must be paid and expired contracts require transfer; \texttt{refuel\_data}
+description says line must be active, max 2 GB per call, and price/consent must
+be confirmed; \texttt{suspend\_line} description says line must be active and the user
+must accept the monthly fee; \texttt{enable\_roaming} description separates account-side
+enablement from the user's device-side Data Roaming toggle; transfer description
+requires an actual tool call for expired contracts, SIM PIN/in-store support, or
+issues outside the tool set. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Procedural Skill Layer}
+& data issues retrieve a quota-check skill that calls \texttt{get\_data\_usage} before
+chasing APN/VPN causes; abroad issues retrieve roaming skills that call
+\texttt{enable\_roaming} when needed and always ask the user to toggle Data Roaming;
+service-loss issues retrieve the overdue-bill workflow: get bills, send payment
+request, wait for payment, resume line, reboot; MMS skills require WiFi Calling
+off, mobile data/APN/SIM/app permissions, and quota check before transfer;
+multiple-cause skills force the agent to continue after one fix if the symptom
+persists; line-selection skill uses the line matching the caller phone number;
+SIM PIN skill separates human transfer for PIN lock from fixable billing work;
+hard-persona skill switches to one short instruction per turn. \\
+\cmidrule(lr){2-3}
+& \multirow{6}{*}{Action Realization Layer}
+& \texttt{get\_customer\_by\_phone} checks NXX-NXX-XXXX phone format; write tools check
+\texttt{customer\_id} format/existence and line ownership; \texttt{send\_payment\_request} checks
+bill ownership, overdue status, no expired-contract restoration trap, and no
+other awaiting-payment bill; \texttt{resume\_line} checks line is suspended, all overdue
+bills are paid, and contract is not expired; \texttt{refuel\_data} checks max 2 GB and
+active line status; \texttt{suspend\_line} checks active line status; \texttt{enable\_roaming}
+blocks when roaming is already enabled and redirects to device toggle;
+\texttt{disable\_roaming} blocks when roaming is already disabled. \\
+\cmidrule(lr){2-3}
+& \multirow{6}{*}{Trajectory Regulation Layer}
+& \texttt{get\_customer\_by\_phone} appends the \texttt{line\_id} matching the caller's phone when the
+customer has multiple lines; \texttt{get\_data\_usage} appends quota-exhausted warning and
+refuel suggestion; \texttt{get\_details\_by\_id} appends roaming-off, quota-exhausted,
+suspended-line, or expired-contract notes; \texttt{get\_bills\_for\_customer} appends overdue
+bill IDs and the send-payment-request to resume-line workflow; \texttt{send\_payment\_request}
+appends the required customer payment, verification, resume, and reboot steps;
+\texttt{enable\_roaming} appends whether the account was newly enabled or already enabled
+and reminds the device-side Data Roaming toggle. \\
+\bottomrule
+\end{tabular}
+\caption{$\tau$-bench and $\tau^2$-bench harness inventory under the four lifecycle layers.}
+\label{tab:taubench-inventory}
+\end{table*}
+
+\begin{table*}[t]
+\huge
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.2pt}
+\renewcommand{\arraystretch}{0.86}
+\begin{tabular}{>{\centering\arraybackslash}m{0.1\textwidth}>{\centering\arraybackslash}m{0.2\textwidth}p{0.7\textwidth}}
+\toprule
+Domain & Layer & Implemented harness content \\
+\midrule
+\multirow{21}{*}{\centering ALFWorld}
+& \multirow{4}{*}{Environment Contract Layer}
+& task parsing extracts task type, target object, destination receptacle,
+required transform, object count, and subgoal chain; task-order hints spell out the
+step order for pick/place, clean, heat, cool, look-at, and pick-two tasks inside
+\texttt{take\_action}; action-tool schema patching appends the hint so the model sees admissible-action and task-order constraints
+on every call. \\
+\cmidrule(lr){2-3}
+& \multirow{4}{*}{Procedural Skill Layer}
+& task-type skill retrieval filters the ALFWorld skill library and BM25-ranks
+matches; injectable contract skills tell the agent to pick up the object before
+cleaning/heating/cooling and to use \texttt{examine X with desklamp}, not plain
+\texttt{examine X}; non-injected library entries document pickup-then-deliver,
+two-object staging, unseen-location search, appliance-as-midpoint, ``nothing
+happens'' recovery, second-object traps, and loop breaking. \\
+\cmidrule(lr){2-3}
+& \multirow{4}{*}{Action Realization Layer}
+& \texttt{pre\_validate\_action} compares the raw action with the current admissible list;
+\texttt{\_gate\_action} canonicalizes close string matches only when the verb is compatible;
+invalid non-navigation actions increment a counter and are blocked after the
+threshold; empty actions trigger explicit feedback; forced next actions from later
+monitors are executed only if still admissible and are discarded when the model
+chooses a task-critical action itself. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Trajectory Regulation Layer}
+& \texttt{WorldModel} updates inventory, current location, visited/unvisited locations,
+observed objects, target location, placed locations, destination locations, and
+lamp location after every observation; subgoal advancement moves through FIND,
+TAKE, CLEAN/HEAT/COOL, GOTO\_DEST, PUT, lamp, and EXAMINE states; post-step monitoring
+catches empty turns, examine-without-lamp loops, oscillation, repeated open/close,
+dead-end look/inventory loops, put/take ``nothing happens'', and generic stalls;
+step guidance proposes a concrete admissible next action; budget checking warns when
+search is late and forces PUT only when the held item and admissible put action
+make completion deterministic. \\
+\midrule
+\multirow{24}{*}{\centering WebShop}
+& \multirow{5}{*}{Environment Contract Layer}
+& task parsing extracts item keywords, required color or color
+alternative, size, material, max price, quantity, style, measurement specs, and
+product category; page-type detection identifies home, search-result, and product
+pages from observations and clickables; page-state tracking records selected
+attributes, ASIN, current price, search queries, back-to-search loops, and page
+stalls; tool-description patching tells the model to search with concise
+keywords, click only visible options, select attributes before buying, and keep
+budget words out of search text. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Procedural Skill Layer}
+& WebShop skill retrieval first filters skills by product category, then
+BM25-ranks against the instruction; skills tell the agent that about 5\% over
+budget can be acceptable, compound colors need exact-or-closest matching,
+petite/tall/plus sizes are combined options, measurements can appear under size
+or other attributes, food flavor and pack count are clickable variants, home
+items use dimension options, code prefixes such as \texttt{01\# black} should be
+matched by visible text, and unavailable exact values should fall back to the
+closest option. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Action Realization Layer}
+& \texttt{pre\_validate\_action} accepts only WebShop search and click action syntax;
+search queries are cleaned to remove price/budget suffixes;
+\texttt{\_fuzzy\_match\_click} maps near-miss clicks to current clickables; unknown tools and
+invisible click targets are blocked; repeated non-navigation clicks are blocked
+after the threshold; \texttt{\_buy\_now\_precheck} blocks \texttt{click[buy now]} while
+visible required color, size, spec, or unselected defensive attribute groups
+remain; forced \texttt{click[buy now]} is cancelled if the precheck still fails. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Trajectory Regulation Layer}
+& post-step monitoring checks the first product-page title against the requested item
+category; detects repeated back-to-search and duplicate-query loops; warns once
+per ASIN when price exceeds budget beyond tolerance; detects product-page stalls
+and asks for an immediate buy-or-back decision; step guidance proposes initial
+searches, ranks visible search results, and builds an attribute checklist from
+requirements and clickables; budget checking warns near the end and forces
+\texttt{click[buy now]} only when the button is visible. \\
+\bottomrule
+\end{tabular}
+\caption{AgentBench harness inventory under the four lifecycle layers (ALFWorld and WebShop).}
+\label{tab:agentbench-inventory}
+\end{table*}
+
+\begin{table*}[t]
+\huge
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2.2pt}
+\renewcommand{\arraystretch}{0.86}
+\begin{tabular}{>{\centering\arraybackslash}m{0.1\textwidth}>{\centering\arraybackslash}m{0.2\textwidth}p{0.7\textwidth}}
+\toprule
+Domain & Layer & Implemented harness content \\
+\midrule
+\multirow{27}{*}{\centering\mbox{OS Interaction}}
+& \multirow{5}{*}{Environment Contract Layer}
+& task parsing classifies the request as count-files, count-lines,
+count-matches, count-unique, largest, smallest, list, read-content, system-info,
+sum-size, average, mutate, or other; it extracts answer shape, target path,
+extension, recursive/non-recursive scope, case-sensitivity, time filter, and size
+filter; tool-description patching tells the model to call bash through the tool
+interface, inspect paths before broad commands, use \texttt{find}/\texttt{grep}/
+\texttt{awk}/\texttt{sort}/\texttt{wc} with correct counting semantics, avoid
+dangerous commands, and submit only the requested answer. \\
+\cmidrule(lr){2-3}
+& \multirow{6}{*}{Procedural Skill Layer}
+& OS skill retrieval tokenizes the task with stopword removal, filters by parsed
+task type, applies a BM25 score threshold, and force-inserts high-confidence
+skills such as case-insensitive matching; the skill library gives concrete command
+patterns for file counts by extension/time/size, recursive search, excluding
+directories, grep line counts, total line counts, unique fields/words, largest or
+smallest files, size totals, disk/memory/process questions, output truncation,
+bracketed/date grep, safe averages, hidden files, field extraction before
+\texttt{sort -u}, non-recursive counts, IP/status parsing, max-number frequency,
+atime versus mtime, LOC, and date-entry counts. \\
+\cmidrule(lr){2-3}
+& \multirow{5}{*}{Action Realization Layer}
+& tool-call rescue converts malformed model text into bash or
+\texttt{answer\_action} calls from JSON, keyword, positional, bare-command, and XML-like
+formats; \texttt{pre\_validate\_action} rejects dangerous shell patterns; repeated identical
+bash commands are blocked after the threshold; text-only loops trigger a forced
+answer when a plausible candidate exists or finish when none exists; \texttt{normalize\_answer}
+strips units/prose for integer or size answers while preserving the required
+string/path answers; \texttt{note\_answer\_submitted} marks the task complete for later
+monitors. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Trajectory Regulation Layer}
+& bash-state tracking records bash history, raw output, truncation, errors,
+empty-output streaks, numeric candidates, string/path candidates, and implausible
+values; post-step monitoring handles truncated output, command-not-found,
+path/glob/permission errors, grep/find/xargs warnings, empty output, repeated
+bash loops, text-only loops, \texttt{grep -c} per-file counts that must be
+summed, post-\texttt{ls} false-zero cases, and budget force/warn; step guidance
+lints missing recursion, wrong case handling, file-versus-line counting, bad
+\texttt{find -path}, missing \texttt{tr} input, date extraction, and human-readable
+size mistakes; it also aggregates extension component counts, formats
+\texttt{wc} filename answers, verifies early numeric answers, and accepts correct
+zeroes, promotes clean string/path candidates, and gives first-turn templates. \\
+\midrule
+\multirow{32}{*}{\centering DBBench}
+& \multirow{6}{*}{Environment Contract Layer}
+& task parsing classifies the SQL request as SELECT, INSERT, UPDATE,
+DELETE, counting, ranking, MAX/MIN/SUM/AVG/COUNT aggregation, comparison, or
+other; answer-shape detection decides scalar integer/float/string, single-column
+multi-row, multi-column multi-row, or mutation-hash answer; schema-map building
+mirrors DBBench identifier sanitization, 64-character truncation, and duplicate
+suffixing; schema-card injection supplies the exact sanitized table and column names;
+tool-description and system-prompt patching state MySQL
+syntax, mutation, schema-card, and commit-format requirements. \\
+\cmidrule(lr){2-3}
+& \multirow{8}{*}{Procedural Skill Layer}
+& DB skill retrieval filters skills by parsed SQL task type, BM25-ranks them,
+and applies heuristic boosts for grouped answers, unique entities, and dataset-average
+updates, next/previous row lookup, currency-text comparison, and insert requests;
+skills give concrete reminders for backticking identifiers, MySQL
+\texttt{CONCAT}, casting text numerics, DESCRIBE/SHOW recovery, LIKE/OR filters,
+SELECT result shape, COUNT, ranking with ORDER BY/LIMIT, returning the requested
+column not the rank, SUM/AVG denominators, INSERT value order, and all columns,
+UPDATE/DELETE WHERE clauses, preview-then-mutate, multi-row commit formatting,
+bare numeric commits, NULL-as-zero, mutation-before-commit, date passthrough,
+GROUP BY/HAVING, BETWEEN, subqueries, apostrophe escaping, mutation verification,
+and the exact inserted text formats. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Action Realization Layer}
+& tool-call rescue extracts \texttt{execute\_sql} or
+\texttt{commit\_final\_answer} from XML, JSON, keyword syntax, and truncated
+partial answers; automatic backtick repair wraps known sanitized table/column names while
+leaving string literals untouched; dialect repair converts common SQLite-style
+patterns to MySQL, where safe; dangerous SQL is blocked; commit gates prevent
+mutation tasks from committing before INSERT/UPDATE/DELETE succeeds, prevent
+empty non-mutation commits, and block scalar commits after clear multi-row
+results; answer-list normalization formats scalar and multi-row answers; NULL
+aggregate candidates become \texttt{0} when the evaluator expects zero; repeated
+SQL with a plausible candidate can force \texttt{commit\_final\_answer}. \\
+\cmidrule(lr){2-3}
+& \multirow{7}{*}{Trajectory Regulation Layer}
+& SQL-state tracking records raw and normalized SQL history, result text,
+error kind, empty streak, candidate answer, answer shape, implausibility,
+mutation-attempt flag, row/column count, and text-only streak; post-step monitoring
+handles text-only tool loops, MySQL syntax errors, unknown columns, and unknown
+tables, mutation tasks that only ran SELECT, NULL aggregates, repeated empty
+mutation previews, repeated empty query results, identical SQL loops, and budget
+force/warn; step guidance promotes plausible candidates, explains the tuple-string
+format for multi-column rows, lints contains-without-LIKE, case-insensitive
+without LOWER, and ranking without ORDER BY, supplies first-turn SQL templates,
+and warns when numeric or scalar candidates look implausible. \\
+\bottomrule
+\end{tabular}
+\caption{AgentBench harness inventory under the four lifecycle layers (OS Interaction and DBBench).}
+\label{tab:agentbench-inventory-os-db}
+\end{table*}
+
+\section{Additional Experiments}
+\label{app:exp}
+
+\paragraph{Dataset statistics and splits.}
+Table~\ref{tab:data_statistics} reports the data statistics used in our experiments. 
+For each environment, we distinguish between the raw training pool, the subset used for harness evolution, and the held-out test/evaluation set. 
+The ``Train Used'' column denotes the number of training examples sampled for each harness-evolution run, rather than the full raw training pool executed in every run. 
+This design keeps harness evolution efficient while ensuring that evaluation is performed on held-out tasks that are not used during harness construction. 
+The ``Used Total'' column reports the total number of examples actually used in our experiments, and ``Raw Pool Total'' reports the full available pool size for each environment.
+
+\paragraph{Detailed Evaluation Configuration}
+Table~\ref{tab:eval-config} summarizes the detailed evaluation configuration. For the Procedural Skill Layer, we use only the top-1 retrieved skill across all experiments, preventing irrelevant skills from contaminating the model context.
+
+\paragraph{Main Results.}
+Table~\ref{tab:appendix-full-results} reports the full results of \method{} across 18 model backbones and 7 benchmarks, showing consistent gains across diverse models and environments.
+\begin{table*}[t]
+    \centering
+    \scriptsize
+    \setlength{\tabcolsep}{3.5pt}
+    \resizebox{\textwidth}{!}{
+    \begin{tabular}{lccccccccccccc}
+    \toprule
+    \multirow{2}{*}{Model}
+    & \multicolumn{4}{c}{AgentBench}
+    & \multicolumn{3}{c}{$\tau$-bench Airline}
+    & \multicolumn{3}{c}{$\tau$-bench Retail}
+    & \multicolumn{3}{c}{$\tau^2$-bench Telecom} \\
+    \cmidrule(lr){2-5}
+    \cmidrule(lr){6-8}
+    \cmidrule(lr){9-11}
+    \cmidrule(lr){12-14}
+    & ALFWorld & WebShop & OS & DBBench
+    & pass@1 & pass@3 & pass\textasciicircum{}3
+    & pass@1 & pass@3 & pass\textasciicircum{}3
+    & pass@1 & pass@3 & pass\textasciicircum{}3 \\
+    \midrule
+    Qwen3-4B-Ins
+    & 0.1651 & 0.2950 & 0.2150 & 0.4400
+    & 0.3500 & 0.6500 & 0.0500
+    & 0.4800 & 0.7000 & 0.2500
+    & 0.2583 & 0.4750 & 0.0750 \\
+    \quad w/ ~\method
+    & \textbf{0.8807} & \textbf{0.4550} & \textbf{0.3960} & \textbf{0.6500}
+    & \textbf{0.6000} & \textbf{0.7000} & \textbf{0.5000}
+    & \textbf{0.6300} & \textbf{0.8000} & \textbf{0.4500}
+    & \textbf{0.5750} & \textbf{0.8750} & \textbf{0.3000} \\
+    \midrule
+    Qwen3.5-4B
+    & 0.4312 & 0.3450 & 0.4236 & 0.5933
+    & 0.8500 & 0.9500 & 0.7000
+    & 0.7917 & 0.9250 & 0.6500
+    & 0.9750 & 1.0000 & 0.9250 \\
+    \quad w/ ~\method
+    & \textbf{0.9266} & \textbf{0.4150} & \textbf{0.4931} & \textbf{0.7133}
+    & \textbf{0.8667} & \textbf{0.9500} & \textbf{0.7500}
+    & \textbf{0.8167} & 0.8750 & \textbf{0.7000}
+    & \textbf{1.0000} & \textbf{1.0000} & \textbf{1.0000} \\
+    \midrule
+    Qwen3.5-9B
+    & 0.5688 & 0.3750 & 0.4028 & 0.6067
+    & 0.8500 & 0.9000 & 0.7500
+    & 0.8333 & 0.9250 & 0.6750
+    & 0.9750 & 1.0000 & 0.9250 \\
+    \quad w/ ~\method
+    & \textbf{0.9174} & \textbf{0.4400} & \textbf{0.5069} & \textbf{0.7033}
+    & \textbf{0.8833} & \textbf{0.9000} & \textbf{0.8500}
+    & 0.8000 & 0.9000 & \textbf{0.7000}
+    & 0.9667 & \textbf{1.0000} & \textbf{0.9250} \\
+    \midrule
+    Qwen2.5-7B-Ins
+    & 0.1284 & 0.3000 & 0.2500 & 0.5133
+    & 0.2000 & 0.4000 & 0.1000
+    & 0.2333 & 0.4250 & 0.0750
+    & 0.3500 & 0.6000 & 0.1500 \\
+    \quad w/ ~\method
+    & \textbf{0.3486} & \textbf{0.4450} & \textbf{0.3542} & \textbf{0.6833}
+    & \textbf{0.4167} & \textbf{0.5500} & \textbf{0.3500}
+    & \textbf{0.2833} & \textbf{0.5500} & \textbf{0.1000}
+    & \textbf{0.5500} & \textbf{0.7750} & \textbf{0.2750} \\
+    \midrule
+    Qwen2.5-14B-Ins
+    & 0.4036 & 0.3950 & 0.2917 & 0.5300
+    & 0.1833 & 0.5000 & 0.0000
+    & 0.4417 & 0.6750 & 0.2000
+    & 0.4000 & 0.5750 & 0.2500 \\
+    \quad w/ ~\method
+    & \textbf{0.4220} & \textbf{0.4500} & \textbf{0.4097} & \textbf{0.6600}
+    & \textbf{0.4833} & \textbf{0.6000} & \textbf{0.3500}
+    & \textbf{0.6167} & \textbf{0.8750} & \textbf{0.3750}
+    & \textbf{0.5833} & \textbf{0.8500} & \textbf{0.2750} \\
+    \midrule
+    Llama-3.1-8B-Ins
+    & 0.0550 & 0.2250 & 0.3125 & 0.1733
+    & 0.3000 & 0.4000 & 0.2500
+    & 0.0750 & 0.1250 & 0.0250
+    & 0.2417 & 0.3250 & 0.1500 \\
+    \quad w/ ~\method
+    & \textbf{0.8257} & \textbf{0.4250} & \textbf{0.3333} & \textbf{0.4967}
+    & \textbf{0.3333} & \textbf{0.4000} & \textbf{0.3000}
+    & 0.0667 & \textbf{0.1250} & 0.0000
+    & \textbf{0.4250} & \textbf{0.5750} & \textbf{0.3500} \\
+    \midrule
+    xLAM-2-3B
+    & 0.0275 & 0.1450 & 0.0694 & 0.2800
+    & 0.2000 & 0.4000 & 0.0500
+    & 0.4000 & 0.6750 & 0.2000
+    & 0.2583 & 0.4500 & 0.1000 \\
+    \quad w/ ~\method
+    & \textbf{0.4312} & \textbf{0.3550} & \textbf{0.1111} & \textbf{0.5400}
+    & \textbf{0.4000} & \textbf{0.4500} & \textbf{0.3000}
+    & \textbf{0.5167} & 0.6500 & \textbf{0.3500}
+    & \textbf{0.4667} & \textbf{0.8000} & \textbf{0.1500} \\
+    \midrule
+    Llama-xLAM-2-8B
+    & 0.0092 & 0.1150 & 0.1389 & 0.2433
+    & 0.3667 & 0.6500 & 0.1500
+    & 0.6083 & 0.7750 & 0.4250
+    & 0.3167 & 0.5750 & 0.1000 \\
+    \quad w/ ~\method
+    & \textbf{0.1193} & \textbf{0.4350} & \textbf{0.1597} & \textbf{0.6300}
+    & \textbf{0.5500} & \textbf{0.6500} & \textbf{0.3500}
+    & \textbf{0.6333} & \textbf{0.8750} & 0.3750
+    & \textbf{0.4417} & \textbf{0.8000} & \textbf{0.1750} \\
+    \midrule
+    Qwen3-30B-A3B-Ins
+    & 0.1101 & 0.3500 & 0.4444 & 0.5767
+    & 0.4167 & 0.6000 & 0.2000
+    & 0.4583 & 0.6750 & 0.2250
+    & 0.3750 & 0.5750 & 0.1750 \\
+    \quad w/ ~\method
+    & \textbf{0.8807} & \textbf{0.4650} & \textbf{0.4583} & \textbf{0.7333}
+    & \textbf{0.6000} & \textbf{0.7000} & \textbf{0.5000}
+    & \textbf{0.5500} & \textbf{0.7250} & \textbf{0.3250}
+    & \textbf{0.7083} & \textbf{0.8750} & \textbf{0.5250} \\
+    \midrule
+    Qwen3.5-27B
+    & 0.8899 & 0.3850 & 0.5417 & 0.6833
+    & 0.8833 & 0.9000 & 0.8500
+    & 0.8333 & 0.9500 & 0.6750
+    & 0.9417 & 1.0000 & 0.8750 \\
+    \quad w/ ~\method
+    & \textbf{0.8899} & \textbf{0.4600} & \textbf{0.5833} & \textbf{0.7400}
+    & 0.8500 & \textbf{0.9000} & 0.8000
+    & \textbf{0.8417} & 0.9250 & \textbf{0.7500}
+    & \textbf{0.9833} & \textbf{1.0000} & \textbf{0.9500} \\
+    \midrule
+    Qwen3.5-35B-A3B
+    & 0.7431 & 0.3800 & 0.5139 & 0.6133
+    & 0.8167 & 1.0000 & 0.7000
+    & 0.8417 & 1.0000 & 0.7000
+    & 0.9500 & 1.0000 & 0.8750 \\
+    \quad w/ ~\method
+    & \textbf{0.9174} & \textbf{0.4300} & \textbf{0.5694} & \textbf{0.6933}
+    & \textbf{0.8333} & 0.9500 & \textbf{0.7500}
+    & 0.8250 & 0.9000 & \textbf{0.7250}
+    & \textbf{0.9583} & \textbf{1.0000} & \textbf{0.9000} \\
+    \midrule
+    Qwen3.6-35B-A3B
+    & 0.7890 & 0.3800 & 0.5208 & 0.6233
+    & 0.8500 & 0.9000 & 0.7500
+    & 0.8000 & 0.9000 & 0.6750
+    & 0.9917 & 1.0000 & 0.9750 \\
+    \quad w/ ~\method
+    & \textbf{0.8991} & \textbf{0.4500} & \textbf{0.5417} & \textbf{0.7133}
+    & \textbf{0.8833} & \textbf{1.0000} & \textbf{0.7500}
+    & \textbf{0.8667} & \textbf{0.9750} & \textbf{0.7250}
+    & \textbf{0.9917} & \textbf{1.0000} & \textbf{0.9750} \\
+    \midrule
+    Qwen3.6-27B
+    & 0.9083 & 0.3850 & 0.5208 & 0.6833
+    & 0.8333 & 0.9500 & 0.7000
+    & 0.8417 & 0.9500 & 0.7250
+    & 0.9667 & 1.0000 & 0.9000 \\
+    \quad w/ ~\method
+    & 0.8991 & \textbf{0.4300} & \textbf{0.5694} & \textbf{0.7433}
+    & 0.8000 & \textbf{0.9500} & \textbf{0.7000}
+    & 0.8333 & 0.9250 & 0.6750
+    & \textbf{0.9750} & \textbf{1.0000} & \textbf{0.9500} \\
+    \midrule
+    Qwen2.5-32B-Ins
+    & 0.7064 & 0.3650 & 0.3681 & 0.5533
+    & 0.3333 & 0.4500 & 0.2000
+    & 0.5333 & 0.9250 & 0.2000
+    & 0.4500 & 0.5500 & 0.3000 \\
+    \quad w/ ~\method
+    & \textbf{0.9266} & \textbf{0.4650} & \textbf{0.4583} & \textbf{0.6933}
+    & \textbf{0.5167} & \textbf{0.6500} & \textbf{0.4000}
+    & \textbf{0.6417} & 0.8750 & \textbf{0.3500}
+    & \textbf{0.7917} & \textbf{0.9250} & \textbf{0.6500} \\
+    \midrule
+    Qwen2.5-72B-Ins
+    & 0.7890 & 0.3600 & 0.4444 & 0.5167
+    & 0.4167 & 0.6500 & 0.2500
+    & 0.6167 & 0.8750 & 0.3000
+    & 0.4667 & 0.7000 & 0.1750 \\
+    \quad w/ ~\method
+    & \textbf{0.8532} & \textbf{0.4800} & \textbf{0.4722} & \textbf{0.7133}
+    & \textbf{0.6034} & \textbf{0.7000} & \textbf{0.4500}
+    & \textbf{0.7000} & 0.8500 & \textbf{0.4750}
+    & \textbf{0.7167} & \textbf{1.0000} & \textbf{0.4000} \\
+    \midrule
+    Llama-3.3-70B-Ins
+    & 0.1835 & 0.3800 & 0.3403 & 0.5833
+    & 0.2667 & 0.3000 & 0.2500
+    & 0.0667 & 0.1000 & 0.0500
+    & 0.3083 & 0.3250 & 0.2750 \\
+    \quad w/ ~\method
+    & \textbf{0.9266} & \textbf{0.4400} & \textbf{0.3958} & \textbf{0.6867}
+    & \textbf{0.3000} & \textbf{0.3500} & \textbf{0.2500}
+    & \textbf{0.0750} & 0.0750 & \textbf{0.0750}
+    & \textbf{0.3333} & \textbf{0.3750} & \textbf{0.3000} \\
+    \midrule
+    xLAM-2-32B
+    & 0.3761 & 0.2300 & 0.2639 & 0.0533
+    & 0.3833 & 0.6000 & 0.1500
+    & 0.6250 & 0.8750 & 0.3750
+    & 0.3917 & 0.6500 & 0.1250 \\
+    \quad w/ ~\method
+    & \textbf{0.9174} & \textbf{0.4600} & \textbf{0.3472} & \textbf{0.3567}
+    & \textbf{0.7000} & \textbf{0.8500} & \textbf{0.5000}
+    & \textbf{0.7083} & \textbf{0.8750} & \textbf{0.5000}
+    & \textbf{0.4583} & \textbf{0.7750} & \textbf{0.1250} \\
+    \midrule
+    Llama-xLAM-2-70B
+    & 0.1101 & 0.2400 & 0.1875 & 0.4433
+    & 0.4500 & 0.6500 & 0.1500
+    & 0.6333 & 0.8000 & 0.4000
+    & 0.3333 & 0.5250 & 0.1250 \\
+    \quad w/ ~\method
+    & \textbf{0.6422} & \textbf{0.4200} & \textbf{0.2500} & \textbf{0.4833}
+    & \textbf{0.6500} & \textbf{0.7500} & \textbf{0.5500}
+    & \textbf{0.7250} & \textbf{0.9250} & \textbf{0.5000}
+    & \textbf{0.4917} & \textbf{0.7750} & \textbf{0.2500} \\
+    \bottomrule
+    \end{tabular}
+    }
+    \caption{
+    Full main results across all evaluated model backbones and benchmarks. For AgentBench environments, we report pass@1 scores. For $\tau$-bench and $\tau^2$-bench environments, we report Pass@1, Pass@3, and Pass\textasciicircum{}3. Each model is evaluated with and without \method. Bold values indicate that \method{} improves or matches the corresponding no-harness result.
+    }
+    \label{tab:appendix-full-results}
+\end{table*}
+\section{AI Assistant Usage}
+We used AI assistants for language polishing and improving the clarity of the manuscript. 
+For the experimental implementation, the iterative development of the runtime harness was assisted by the coding agent Codex. 
+All experimental design, analysis, and final results were reviewed and verified by the authors.

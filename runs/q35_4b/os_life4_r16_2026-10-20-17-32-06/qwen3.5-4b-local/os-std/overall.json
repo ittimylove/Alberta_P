@@ -1,0 +1,33 @@
+{
+    "total": 144,
+    "validation": {
+        "running": 0.0,
+        "completed": 0.8958333333333334,
+        "agent context limit": 0.0,
+        "agent validation failed": 0.0,
+        "agent invalid action": 0.0,
+        "task limit reached": 0.0763888888888889,
+        "unknown": 0.0,
+        "task error": 0.027777777777777776,
+        "average_history_length": 20.708333333333332,
+        "max_history_length": 79,
+        "min_history_length": 4
+    },
+    "custom": {
+        "overall": {
+            "total": 144,
+            "pass": 71,
+            "wrong": 73,
+            "acc": 0.4930555555555556
+        },
+        "token_usage": {
+            "total_prompt_tokens": 1503365,
+            "total_completion_tokens": 186148,
+            "total_tokens": 1689513,
+            "avg_prompt_tokens_per_episode": 10440,
+            "avg_completion_tokens_per_episode": 1293,
+            "avg_total_tokens_per_episode": 11733
+        },
+        "_worker_aggregate_error": "http://172.18.0.3:5021/api/calculate_overall -> ConnectTimeout(MaxRetryError(\"HTTPConnectionPool(host='172.18.0.3', port=5021): Max retries exceeded with url: /api/calculate_overall (Caused by ConnectTimeoutError(<urllib3.connection.HTTPConnection object at 0x778eebe50b50>, 'Connection to 172.18.0.3 timed out. (connect timeout=120)'))\"))"
+    }
+}

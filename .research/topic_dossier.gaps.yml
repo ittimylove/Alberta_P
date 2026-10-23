@@ -1,0 +1,39 @@
+dossier: topic_dossier.md
+date: 2026-10-19
+scope: "模型升级后 harness 适配；本地 8 篇 + 343 篇引用网络 + 4 组网络检索"
+recall_confidence: medium
+candidates:
+  - id: G1
+    name: 分层失配（同家族升级 × 7 层消融）
+    opening_type: B
+    gates: {open: 3, contribution: 4, feasible: 3}
+    verdict: conditional-go
+    closest_work: ["2609.20804", "2610.00917", "2604.25850", "2606.06324", "2608.10178", "2609.24974"]
+    open_questions:
+      - "2609.20804 和 2610.00917 的正文里是否有同家族新旧两代的模型对"
+      - "能否同时调到同家族前后两代的便宜模型"
+      - "10 题、k=3 的试点方差"
+    kill_test: "两篇正文里都有同家族的模型对，并且做了组件级分析"
+  - id: G2
+    name: AHE 组件冲突定位
+    opening_type: A
+    gates: {open: 3, contribution: 3, feasible: 2}
+    verdict: merge-into-G1
+    closest_work: ["2604.25850", "2609.20804", "2608.01918", "2609.33123"]
+    reason: "作为独立题需要复现 AHE，和用户的约束冲突"
+  - id: G3
+    name: 旧模型当 meta-agent
+    opening_type: B
+    gates: {open: 2, contribution: 2, feasible: 1}
+    verdict: park
+    closest_work: ["2605.30621", "2606.09498", "2609.38372", "2608.09096"]
+    reason: "2605.30621 显示写改动的能力在不同能力档之间基本持平；HarnessX 代码未公开；frontier meta-agent 成本过高"
+    salvage: "改写为'演化历史跨升级迁移'"
+  - id: G4
+    name: 新旧轨迹对比诊断
+    opening_type: A
+    gates: {open: 2, contribution: 3, feasible: 4}
+    verdict: merge-into-G1
+    closest_work: ["2609.14857", "2609.00829", "2601.22758", "2610.11655", "2610.00917"]
+    open_questions: ["ModularRSI 对比的成功和失败轨迹是否来自不同模型"]
+selection: pending-user
